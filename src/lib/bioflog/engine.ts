@@ -119,7 +119,7 @@ function farmLocalDate(iso: string, tz: string) {
   return new Date(iso).toLocaleDateString("en-CA", { timeZone: tz });
 }
 
-function emptyDb(): Database {
+export function emptyDb(): Database {
   return {
     farm: { id: "farm-utama", name: "Farm Utama", timezone: "Asia/Jakarta", address: "Sabak Sentral", version: 1 },
     users: [],

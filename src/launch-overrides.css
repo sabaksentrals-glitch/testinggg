@@ -1,0 +1,14 @@
+/* Launch hardening: the historical demo credentials are no longer a supported
+   production login path. Keep the old component markup hidden until the UI is
+   cleaned up after the pilot release. */
+.login-form > small,
+.demo-accounts {
+  display: none !important;
+}
+
+/* The exported UI still emits an optimistic local-success toast immediately
+   after dispatch. Server writes are authoritative now, so suppress that stale
+   message; the store shows a loading state until the server accepts/rejects. */
+.notice.toast {
+  display: none !important;
+}

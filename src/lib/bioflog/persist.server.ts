@@ -1,5 +1,6 @@
 import { dbSource, getSql, type Sql } from "@/lib/db";
 import { hashPassword } from "./engine";
+import { mayApplyDemoLogins } from "./load-policy";
 import { DEMO_ACCOUNTS, DEMO_PASSWORD } from "./types";
 import type {
   Allocation,
@@ -42,7 +43,16 @@ function asDb(payload: unknown): Database | null {
   return withDemoLogins(p);
 }
 
+/**
+ * Force the demo password onto the demo accounts — DEMO/LOCAL BACKENDS ONLY.
+ *
+ * On Neon the stored hashes are real credentials. Rewriting them on every load
+ * meant a password change could never stick, and any account named like a demo
+ * account stayed pinned to the password published in the README. On Neon we now
+ * return the row exactly as stored and let the operator own their credentials.
+ */
 function withDemoLogins(db: Database): Database {
+  if (!mayApplyDemoLogins(dbSource)) return db;
   const hash = hashPassword(DEMO_PASSWORD);
   const emails = new Set(DEMO_ACCOUNTS.map((a) => a.email));
   return {
@@ -171,8 +181,33 @@ export async function loadFarmStateFromDb(): Promise<FarmLoad> {
   return { source: dbSource, db: null, pondCount: 0, updatedAt: null };
 }
 
+/**
+ * Server-side backstop for the client's write guard.
+ *
+ * A Neon database with no `bioflog_state` row yet is either brand new or not
+ * migrated. Either way the first row must not come from whatever the browser
+ * happens to be holding — that is exactly how demo seed data becomes the
+ * production ledger. Legitimate bootstrap goes through `importFromRelational`,
+ * which writes the snapshot server-side from the relational tables. Set
+ * `BIOFLOG_ALLOW_SEED=1` to seed a fresh production database deliberately.
+ */
+async function assertMayInitialise(sql: Sql): Promise<void> {
+  if (dbSource !== "neon") return;
+  if (process.env.BIOFLOG_ALLOW_SEED === "1") return;
+  const rows = await sql<{ present: boolean }>`
+    select exists (select 1 from bioflog_state where id = 'default') as present
+  `;
+  if (rows[0]?.present) return;
+  throw new Error(
+    "Refusing to initialise an empty Neon bioflog_state from client-supplied " +
+      "state. Run migrations and import the real data, or set BIOFLOG_ALLOW_SEED=1 " +
+      "to seed this database deliberately.",
+  );
+}
+
 export async function saveFarmStateToDb(db: Database): Promise<FarmLoad> {
   const sql = await getSql();
+  await assertMayInitialise(sql);
   await saveSnapshot(sql, db);
   return {
     source: dbSource,
