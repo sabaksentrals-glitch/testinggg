@@ -3,7 +3,10 @@ set -eu
 cd /workspace
 # :8081 is QA-only — a revive must never inherit a stale built-output preview.
 node scripts/preview.mjs stop || true
-if [ -f /tmp/bioflog-database-url ]; then
+if [ -f /workspace/.local/database-url ]; then
+  DATABASE_URL=$(cat /workspace/.local/database-url)
+  export DATABASE_URL
+elif [ -f /tmp/bioflog-database-url ]; then
   DATABASE_URL=$(cat /tmp/bioflog-database-url)
   export DATABASE_URL
 fi

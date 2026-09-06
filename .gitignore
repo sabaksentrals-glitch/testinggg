@@ -15,4 +15,4 @@ AGENTS.md
 .grok/status
 .grok/og-pending
 .node_modules.lock
-.project_id
+.local/
