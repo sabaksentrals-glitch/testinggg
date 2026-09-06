@@ -22,6 +22,13 @@ import {
   strongPasswordHash,
   validatePasswordChange,
 } from "./password-policy";
+import {
+  readState,
+  upsertState,
+  writeStateIfUnchanged,
+  type StateRevision,
+  type StateWrite,
+} from "./state-store";
 
 const SESSION_TTL_SECONDS = 8 * 60 * 60;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
@@ -30,7 +37,10 @@ const LOGIN_MAX_FAILURES = 5;
 type StoredState = {
   db: Database;
   sql: Sql;
+  /** Display metadata only — millisecond ISO, never used for compare. */
   updatedAt: string;
+  /** Exact optimistic-concurrency token. Server-side only. */
+  revision: StateRevision;
 };
 
 type SessionClaims = {
@@ -55,15 +65,6 @@ type ClientView = Row & {
 const globalSession = globalThis as typeof globalThis & {
   __bioflogLocalSessionSecret__?: Buffer;
 };
-
-function asIso(value: unknown): string {
-  if (value instanceof Date) return value.toISOString();
-  const parsed = new Date(String(value));
-  if (Number.isNaN(parsed.getTime())) {
-    throw new Problem("STATE_TIMESTAMP", "Timestamp state database tidak valid.", 503);
-  }
-  return parsed.toISOString();
-}
 
 function asDatabase(payload: unknown): Database | null {
   let candidate = payload;
@@ -98,16 +99,16 @@ function assertDeploymentDatabase(): void {
   }
 }
 
+const invalidTimestamp = () =>
+  new Problem("STATE_TIMESTAMP", "Timestamp state database tidak valid.", 503);
+
 async function loadStoredState(): Promise<StoredState> {
   assertDeploymentDatabase();
   const sql = await getSql();
-  const rows = await sql.query<{ payload: unknown; updated_at: unknown }>(
-    "select payload, updated_at from bioflog_state where id = 'default'",
-  );
-  const row = rows[0];
-  const db = row ? asDatabase(row.payload) : null;
-  if (db && row) {
-    return { db, sql, updatedAt: asIso(row.updated_at) };
+  const stored = await readState(sql, invalidTimestamp);
+  const db = stored ? asDatabase(stored.payload) : null;
+  if (db && stored) {
+    return { db, sql, updatedAt: stored.updatedAt, revision: stored.revision };
   }
 
   // Local development may bootstrap demo data. A real Neon database never
@@ -115,17 +116,12 @@ async function loadStoredState(): Promise<StoredState> {
   // implicit demo seed.
   if (dbSource === "pglite" && process.env.VERCEL !== "1") {
     const seeded = seedDemo();
-    const inserted = await sql.query<{ updated_at: unknown }>(
-      `insert into bioflog_state (id, payload, updated_at)
-       values ('default', $1::jsonb, now())
-       on conflict (id) do update set payload = excluded.payload, updated_at = now()
-       returning updated_at`,
-      [JSON.stringify(seeded)],
-    );
+    const inserted = await upsertState(sql, seeded, invalidTimestamp);
     return {
       db: seeded,
       sql,
-      updatedAt: asIso(inserted[0]?.updated_at ?? new Date()),
+      updatedAt: inserted.updatedAt,
+      revision: inserted.revision,
     };
   }
 
@@ -136,26 +132,24 @@ async function loadStoredState(): Promise<StoredState> {
   );
 }
 
+/**
+ * Optimistic concurrency on the exact MVCC revision the read handed us, never
+ * on a reformatted timestamp. A null result here is a genuine concurrent write.
+ */
 async function saveStoredState(
   sql: Sql,
   db: Database,
-  expectedUpdatedAt: string,
-): Promise<string> {
-  const rows = await sql.query<{ updated_at: unknown }>(
-    `update bioflog_state
-        set payload = $1::jsonb, updated_at = now()
-      where id = 'default' and updated_at = $2::timestamptz
-      returning updated_at`,
-    [JSON.stringify(db), expectedUpdatedAt],
-  );
-  if (!rows.length) {
+  expectedRevision: StateRevision,
+): Promise<StateWrite> {
+  const written = await writeStateIfUnchanged(sql, db, expectedRevision, invalidTimestamp);
+  if (!written) {
     throw new Problem(
       "STATE_CONFLICT",
       "Data berubah dari sesi lain. Muat ulang lalu ulangi tindakan agar perubahan tidak saling menimpa.",
       409,
     );
   }
-  return asIso(rows[0].updated_at);
+  return written;
 }
 
 function sessionSecret(): Buffer {
@@ -439,7 +433,7 @@ export async function mutateFarmSession(
     }
   }
 
-  const updatedAt = await saveStoredState(state.sql, state.db, state.updatedAt);
+  const saved = await saveStoredState(state.sql, state.db, state.revision);
   const currentUser = state.db.users.find(
     (candidate) => candidate.id === user.id && candidate.active,
   );
@@ -451,7 +445,7 @@ export async function mutateFarmSession(
   return {
     source: dbSource,
     pondCount: state.db.ponds.length,
-    updatedAt,
+    updatedAt: saved.updatedAt,
     sessionToken: makeSession(currentUser, requiresPasswordChange),
     requiresPasswordChange,
     result,
