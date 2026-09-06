@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { Row, Role } from "./types";
 import { getFarmStatus, loginFarm, mutateFarm, resumeFarm } from "./api";
+import { validatePasswordChange } from "./password-policy";
 
 export class Problem extends Error {
   code: string;
@@ -43,6 +44,12 @@ type Store = {
   user: () => ClientUser | null;
   state: () => Row | null;
   mutate: (action: string, payload: Row) => Row;
+  /**
+   * Forced rotation for a legacy pilot credential. Async on purpose: the caller
+   * must be able to await the server's verdict and show the real error, which
+   * the fire-and-forget `mutate` shim cannot express.
+   */
+  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   financeReport: (from: string, to: string) => Row;
   audit: () => Row[];
   resetDemo: () => void;
@@ -316,6 +323,53 @@ export const useBioflog = create<Store>()(
             mutationInFlight = false;
           });
         return {};
+      },
+      changePassword: async (currentPassword, newPassword) => {
+        const token = get().sessionToken;
+        if (!token) {
+          throw new Problem("UNAUTHENTICATED", "Sesi berakhir. Masuk kembali.", 401);
+        }
+        const invalid = validatePasswordChange({
+          current: currentPassword,
+          next: newPassword,
+        });
+        if (invalid) throw new Problem(invalid.code, invalid.message);
+        if (mutationInFlight) {
+          throw new Problem("SAVE_BUSY", "Permintaan sebelumnya masih berjalan.", 409);
+        }
+        mutationInFlight = true;
+        set({ syncError: null });
+        try {
+          await mutateFarm({
+            data: {
+              sessionToken: token,
+              action: "users/password",
+              payload: {
+                current_password: currentPassword,
+                new_password: newPassword,
+              },
+            },
+          });
+          // The rotation bumps the user version, so the restricted token is
+          // spent. Drop it and make the operator sign in with the new password.
+          set({
+            sessionToken: null,
+            userData: null,
+            view: null,
+            requiresPasswordChange: false,
+            hydrated: true,
+            syncError: "Password berhasil diganti. Silakan masuk kembali.",
+          });
+        } catch (error) {
+          // Keep the restricted session on failure — a mistyped current
+          // password must not eject the operator back to a login form they
+          // cannot get past.
+          throw error instanceof Error
+            ? error
+            : new Problem("PASSWORD_CHANGE", "Gagal mengganti password.");
+        } finally {
+          mutationInFlight = false;
+        }
       },
       financeReport: (from, to) => {
         const view = get().view;

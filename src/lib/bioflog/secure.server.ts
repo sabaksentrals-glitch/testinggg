@@ -3,7 +3,6 @@ import {
   createHmac,
   randomBytes,
   randomUUID,
-  scryptSync,
   timingSafeEqual,
 } from "node:crypto";
 import { dbSource, getSql, type Sql } from "@/lib/db";
@@ -12,15 +11,21 @@ import {
   Problem,
   auditLog,
   dispatch,
-  hashPassword,
   seedDemo,
   snapshot,
 } from "./engine";
+import {
+  mayRunRestrictedAction,
+  passwordMatches,
+  requiresPasswordUpgrade as policyRequiresPasswordUpgrade,
+  shouldWithholdView,
+  strongPasswordHash,
+  validatePasswordChange,
+} from "./password-policy";
 
 const SESSION_TTL_SECONDS = 8 * 60 * 60;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 5;
-const SCRYPT_BYTES = 32;
 
 type StoredState = {
   db: Database;
@@ -214,31 +219,10 @@ function parseClaims(token: string): SessionClaims {
   return claims;
 }
 
-function isStrongPasswordHash(value: string): boolean {
-  return /^scrypt\$[0-9a-f]{32}\$[0-9a-f]{64}$/i.test(value);
-}
-
-function strongPasswordHash(password: string): string {
-  const salt = randomBytes(16);
-  const derived = scryptSync(password, salt, SCRYPT_BYTES);
-  return `scrypt$${salt.toString("hex")}$${derived.toString("hex")}`;
-}
-
-function passwordMatches(password: string, stored: string): boolean {
-  if (!isStrongPasswordHash(stored)) {
-    // Compatibility with the exported Grok pilot state. Every production user
-    // with this legacy hash is forced through a password-change upgrade before
-    // any farm data is returned.
-    return hashPassword(password) === stored;
-  }
-  const [, saltHex, expectedHex] = stored.split("$");
-  const expected = Buffer.from(expectedHex, "hex");
-  const actual = scryptSync(password, Buffer.from(saltHex, "hex"), expected.length);
-  return actual.length === expected.length && timingSafeEqual(actual, expected);
-}
-
+// Password rules live in `password-policy.ts` so the test runner can reach them
+// (this module imports `@/lib/db` and is therefore not importable in tests).
 function requiresPasswordUpgrade(user: User): boolean {
-  return dbSource === "neon" && !isStrongPasswordHash(user.password_hash);
+  return policyRequiresPasswordUpgrade(user.password_hash, dbSource);
 }
 
 function publicUser(user: User): Row {
@@ -334,14 +318,17 @@ async function recordLoginAttempt(
 function changeOwnPassword(db: Database, user: User, payload: Row): Row {
   const current = String(payload.current_password ?? "");
   const replacement = String(payload.new_password ?? "");
-  if (!passwordMatches(current, user.password_hash)) {
-    throw new Problem("PASSWORD_INVALID", "Password saat ini tidak cocok.", 403);
-  }
-  if (replacement.length < 12 || replacement.length > 256) {
-    throw new Problem("PASSWORD_LENGTH", "Password baru harus 12–256 karakter.");
-  }
-  if (replacement === current) {
-    throw new Problem("PASSWORD_REUSE", "Password baru harus berbeda dari password saat ini.");
+  const invalid = validatePasswordChange({
+    current,
+    next: replacement,
+    storedHash: user.password_hash,
+  });
+  if (invalid) {
+    throw new Problem(
+      invalid.code,
+      invalid.message,
+      invalid.code === "PASSWORD_INVALID" ? 403 : 422,
+    );
   }
   user.password_hash = strongPasswordHash(replacement);
   user.version += 1;
@@ -405,7 +392,7 @@ export async function loginFarmSession(emailInput: string, password: string) {
     sessionToken: makeSession(user, requiresPasswordChange),
     requiresPasswordChange,
     user: publicUser(user),
-    view: requiresPasswordChange ? null : clientView(state.db, user),
+    view: shouldWithholdView(requiresPasswordChange) ? null : clientView(state.db, user),
   };
 }
 
@@ -420,7 +407,7 @@ export async function resumeFarmSession(sessionToken: string) {
     sessionToken: makeSession(user, requiresPasswordChange),
     requiresPasswordChange,
     user: publicUser(user),
-    view: requiresPasswordChange ? null : clientView(state.db, user),
+    view: shouldWithholdView(requiresPasswordChange) ? null : clientView(state.db, user),
   };
 }
 
@@ -431,7 +418,7 @@ export async function mutateFarmSession(
 ) {
   const state = await loadStoredState();
   const { user, claims } = sessionUser(state.db, sessionToken);
-  if (claims.restricted === 1 && action !== "users/password") {
+  if (!mayRunRestrictedAction(claims.restricted === 1, action)) {
     throw new Problem(
       "PASSWORD_CHANGE_REQUIRED",
       "Password lama wajib diganti sebelum akun dapat membuka atau mengubah data farm.",
@@ -468,6 +455,6 @@ export async function mutateFarmSession(
     sessionToken: makeSession(currentUser, requiresPasswordChange),
     requiresPasswordChange,
     result,
-    view: requiresPasswordChange ? null : clientView(state.db, currentUser),
+    view: shouldWithholdView(requiresPasswordChange) ? null : clientView(state.db, currentUser),
   };
 }

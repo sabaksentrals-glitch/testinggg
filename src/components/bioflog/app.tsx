@@ -25,6 +25,7 @@ import {
   Activity,
 } from "lucide-react";
 import { useBioflog, DEMO_PASSWORD } from "@/lib/bioflog/store";
+import { PASSWORD_MIN, validatePasswordChange } from "@/lib/bioflog/password-policy";
 import { DEMO_ACCOUNTS, type Row } from "@/lib/bioflog/types";
 import {
   kindNames,
@@ -310,6 +311,13 @@ export function BioflogApp() {
   const [email, setEmail] = useState("admin@bioflog.local");
   const [password, setPassword] = useState(DEMO_PASSWORD);
   const [ready, setReady] = useState(false);
+  // Forced password rotation. Held in component state only — never persisted,
+  // never logged.
+  const [rotCurrent, setRotCurrent] = useState("");
+  const [rotNext, setRotNext] = useState("");
+  const [rotConfirm, setRotConfirm] = useState("");
+  const [rotError, setRotError] = useState("");
+  const [rotBusy, setRotBusy] = useState(false);
 
   useEffect(() => {
     setReady(true);
@@ -338,6 +346,34 @@ export function BioflogApp() {
       setLoginError(err instanceof Error ? err.message : "Gagal masuk");
     }
   }
+  async function submitRotation(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setRotError("");
+    const invalid = validatePasswordChange({
+      current: rotCurrent,
+      next: rotNext,
+      confirm: rotConfirm,
+    });
+    if (invalid) {
+      setRotError(invalid.message);
+      return;
+    }
+    setRotBusy(true);
+    try {
+      await store.changePassword(rotCurrent, rotNext);
+      // Success clears the session in the store; drop the plaintext we held.
+      setRotCurrent("");
+      setRotNext("");
+      setRotConfirm("");
+      setPassword("");
+      setPage("dashboard");
+    } catch (err) {
+      setRotError(err instanceof Error ? err.message : "Gagal mengganti password.");
+    } finally {
+      setRotBusy(false);
+    }
+  }
+
   function logout() {
     if (!confirm("Keluar dari farm?")) return;
     store.logout();
@@ -352,6 +388,92 @@ export function BioflogApp() {
       <div className="loading">
         <Fish size={40} />
         <h2>Menyambungkan ke Neon…</h2>
+      </div>
+    );
+
+  // Forced password rotation. A legacy pilot credential logs in successfully but
+  // the server withholds the farm view until the password is rotated, so the
+  // account has a user and no state. This branch MUST come before the login
+  // gate below: sending it to the login form is what deadlocked the account,
+  // because the only password form lived behind the view.
+  if (user && !state && store.requiresPasswordChange)
+    return (
+      <div className="login">
+        <div className="login-story">
+          <div className="brand">
+            <Fish size={40} />
+            <div>
+              BIOFLOG<small>SABAK SENTRAL</small>
+            </div>
+          </div>
+          <div>
+            <span className="eyebrow">KEAMANAN AKUN</span>
+            <h1>
+              Ganti password
+              <br />
+              pilot lama
+              <br />
+              <em>sekali saja.</em>
+            </h1>
+            <p>
+              Akun ini masih memakai password pilot yang pernah dipublikasikan. Data farm
+              dibuka setelah Anda memilih password baru.
+            </p>
+          </div>
+          <small>BFG-SS-BP-001 · Rotasi kredensial wajib</small>
+        </div>
+        <form className="login-form" onSubmit={submitRotation}>
+          <span className="eyebrow">ROTASI KREDENSIAL WAJIB</span>
+          <h2>Buat password baru</h2>
+          <p className="muted">
+            Password baru minimal {PASSWORD_MIN} karakter dan harus berbeda dari password
+            lama. Pilih sendiri — jangan bagikan kepada siapa pun.
+          </p>
+          <label>
+            Akun
+            <input type="email" value={user.email} readOnly disabled />
+          </label>
+          <label>
+            Password saat ini
+            <input
+              type="password"
+              required
+              autoComplete="current-password"
+              value={rotCurrent}
+              onChange={(e) => setRotCurrent(e.target.value)}
+            />
+          </label>
+          <label>
+            Password baru
+            <input
+              type="password"
+              required
+              minLength={PASSWORD_MIN}
+              autoComplete="new-password"
+              value={rotNext}
+              onChange={(e) => setRotNext(e.target.value)}
+            />
+          </label>
+          <label>
+            Konfirmasi password baru
+            <input
+              type="password"
+              required
+              minLength={PASSWORD_MIN}
+              autoComplete="new-password"
+              value={rotConfirm}
+              onChange={(e) => setRotConfirm(e.target.value)}
+            />
+          </label>
+          {rotError && <p className="error">{rotError}</p>}
+          <button className="primary" disabled={rotBusy}>
+            {rotBusy ? "Menyimpan…" : "Ganti password dan masuk kembali"}
+            <ChevronRight size={18} />
+          </button>
+          <button type="button" className="secondary" onClick={() => store.logout()}>
+            Batal dan keluar
+          </button>
+        </form>
       </div>
     );
 
