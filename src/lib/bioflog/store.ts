@@ -38,11 +38,11 @@ type Store = {
   requiresPasswordChange: boolean;
   setHydrated: (v: boolean) => void;
   pullRemote: () => Promise<void>;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string) => ClientUser | null;
   logout: () => void;
   user: () => ClientUser | null;
   state: () => Row | null;
-  mutate: (action: string, payload: Row) => Promise<Row>;
+  mutate: (action: string, payload: Row) => Row;
   financeReport: (from: string, to: string) => Row;
   audit: () => Row[];
   resetDemo: () => void;
@@ -59,6 +59,8 @@ type SessionResponse = {
 };
 
 let pullPromise: Promise<void> | null = null;
+let loginInFlight = false;
+let mutationInFlight = false;
 
 function errorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
@@ -83,7 +85,7 @@ function applySession(
     dbSource: response.source,
     pondCount: response.pondCount,
     syncError: response.requiresPasswordChange
-      ? "Password awal masih merupakan password demo publik. Ganti password sebelum membuka data farm."
+      ? "Akun ini masih memakai hash password pilot lama. Rotasi kredensial wajib dilakukan sebelum data farm dapat dibuka."
       : null,
     requiresPasswordChange: response.requiresPasswordChange,
     hydrated: true,
@@ -213,10 +215,26 @@ export const useBioflog = create<Store>()(
         });
         return pullPromise;
       },
-      login: async (email, password) => {
+      login: (email, password) => {
+        if (loginInFlight) return null;
+        loginInFlight = true;
         set({ syncError: null });
-        const response = (await loginFarm({ data: { email, password } })) as SessionResponse;
-        applySession(set, response);
+        void loginFarm({ data: { email, password } })
+          .then((response) => applySession(set, response as SessionResponse))
+          .catch((error) => {
+            set({
+              sessionToken: null,
+              userData: null,
+              view: null,
+              requiresPasswordChange: false,
+              hydrated: true,
+              syncError: errorMessage(error, "Gagal masuk."),
+            });
+          })
+          .finally(() => {
+            loginInFlight = false;
+          });
+        return null;
       },
       logout: () =>
         set({
@@ -228,42 +246,76 @@ export const useBioflog = create<Store>()(
         }),
       user: () => get().userData,
       state: () => get().view,
-      mutate: async (action, payload) => {
+      mutate: (action, payload) => {
         const token = get().sessionToken;
         if (!token) {
           throw new Problem("UNAUTHENTICATED", "Sesi berakhir. Masuk kembali.", 401);
         }
-        try {
-          const response = (await mutateFarm({
-            data: { sessionToken: token, action, payload },
-          })) as SessionResponse & { result: Row };
-          const nextUser = asClientUser(response.view?.user) ?? get().userData;
-          set({
-            sessionToken: response.sessionToken,
-            userData: nextUser,
-            view: response.view,
-            dbSource: response.source,
-            pondCount: response.pondCount,
-            requiresPasswordChange: response.requiresPasswordChange,
-            syncError: response.requiresPasswordChange
-              ? "Password awal wajib diganti sebelum membuka data farm."
-              : null,
-          });
-          if (action === "users/password") {
+        if (mutationInFlight) {
+          throw new Problem("SAVE_BUSY", "Penyimpanan sebelumnya masih berjalan. Tunggu sebentar.", 409);
+        }
+        mutationInFlight = true;
+        // The legacy UI calls mutate synchronously. Enter an explicit loading
+        // state immediately so the screen never keeps presenting an optimistic
+        // edit as authoritative while the server is still validating it.
+        set({ hydrated: false, syncError: null });
+        void mutateFarm({ data: { sessionToken: token, action, payload } })
+          .then((rawResponse) => {
+            const response = rawResponse as SessionResponse & { result: Row };
+            const nextUser = asClientUser(response.view?.user) ?? get().userData;
+            const provisioningToken = response.result?.provisioning_token;
+            if (provisioningToken && typeof window !== "undefined") {
+              window.alert(
+                "Simpan token perangkat ini sekali. Token tidak akan ditampilkan lagi:\n\n" +
+                  provisioningToken,
+              );
+            }
+            if (action === "users/password") {
+              set({
+                sessionToken: null,
+                userData: null,
+                view: null,
+                dbSource: response.source,
+                pondCount: response.pondCount,
+                requiresPasswordChange: false,
+                hydrated: true,
+                syncError: "Password berhasil diganti. Silakan masuk kembali.",
+              });
+              return;
+            }
+            set({
+              sessionToken: response.sessionToken,
+              userData: nextUser,
+              view: response.view,
+              dbSource: response.source,
+              pondCount: response.pondCount,
+              requiresPasswordChange: response.requiresPasswordChange,
+              hydrated: true,
+              syncError: response.requiresPasswordChange
+                ? "Rotasi password wajib sebelum melanjutkan."
+                : null,
+            });
+          })
+          .catch((error) => {
+            // Fail visibly. We deliberately drop the local session instead of
+            // leaving the operator on a screen that claimed a rejected write
+            // had succeeded.
             set({
               sessionToken: null,
               userData: null,
               view: null,
               requiresPasswordChange: false,
-              syncError: "Password berhasil diganti. Silakan masuk kembali.",
+              hydrated: true,
+              syncError: errorMessage(
+                error,
+                "Perubahan ditolak server dan tidak disimpan. Silakan masuk kembali.",
+              ),
             });
-          }
-          return response.result;
-        } catch (error) {
-          const message = errorMessage(error, "Gagal menyimpan ke server.");
-          set({ syncError: message });
-          throw error;
-        }
+          })
+          .finally(() => {
+            mutationInFlight = false;
+          });
+        return {};
       },
       financeReport: (from, to) => {
         const view = get().view;
@@ -276,6 +328,7 @@ export const useBioflog = create<Store>()(
         return Array.isArray(view.__audit) ? view.__audit : [];
       },
       resetDemo: () => {
+        set({ hydrated: false });
         void get().pullRemote();
       },
     }),
@@ -288,3 +341,7 @@ export const useBioflog = create<Store>()(
     },
   ),
 );
+
+// Compatibility export for the old login component. The real pilot no longer
+// pre-fills or publishes the historical demo password.
+export const DEMO_PASSWORD = "";
