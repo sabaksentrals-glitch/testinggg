@@ -3,9 +3,12 @@
 BIOFLOG · Sabak Sentral — operasional farm bioflok.
 
 - GitHub: [sabaksentrals-glitch/testinggg](https://github.com/sabaksentrals-glitch/testinggg)
-- Database: Neon Postgres **testinggg** (org SABAK SENTRAL, `aws-ap-southeast-1`, Postgres 18)
-  - Project ID: `odd-cherry-79935792`
-  - Branch default: `br-tiny-mountain-b3jiz0i2` · database `neondb` · role `neondb_owner`
+- Database: Neon Postgres **Testingg2** (org SABAK SENTRAL, `aws-ap-southeast-1`, Postgres 18)
+  - Project ID: `empty-bonus-99002446`
+  - Branch default: `br-dawn-wildflower-b3dz448b` · database `neondb` · role `neondb_owner`
+  - Database baru & kosong: hanya `_migrations` + `bioflog_state` dari `migrations/`.
+    Aplikasi menyemai data demo di memori pada load pertama dan menuliskan snapshot ke
+    Neon begitu ada aksi pertama (lihat `queueSave` di `src/lib/bioflog/store.ts`).
 
 Ledger kolam, siklus, pakan, kualitas air, dan tugas tersimpan di Neon. Pratinjau tanpa `DATABASE_URL` memakai PGLite lokal.
 
@@ -16,11 +19,11 @@ Akun demo (password sama): `admin@bioflog.local` · `BioflogDemo12`
 `src/lib/db.ts` memilih backend dari `DATABASE_URL`: terisi → Neon (driver `pg`), kosong → PGLite embedded. Tidak ada perubahan kode saat berpindah.
 
 Connection string berisi password, jadi **tidak pernah** di-commit. Ambil dari
-[Neon Console](https://console.neon.tech) → project `testinggg` → **Connect**, lalu simpan:
+[Neon Console](https://console.neon.tech) → project `Testingg2` → **Connect**, lalu simpan:
 
 ```sh
 mkdir -p .local
-printf '%s' 'postgresql://neondb_owner:<password>@ep-gentle-star-b3hu04ya-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?channel_binding=require&sslmode=require' > .local/database-url
+printf '%s' 'postgresql://neondb_owner:<password>@ep-late-mouse-b3w4czf5-pooler.c-4.ap-southeast-1.aws.neon.tech/neondb?channel_binding=require&sslmode=require' > .local/database-url
 chmod 600 .local/database-url
 ```
 
