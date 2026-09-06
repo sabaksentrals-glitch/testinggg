@@ -3,21 +3,16 @@ import {
   createHmac,
   randomBytes,
   randomUUID,
+  scryptSync,
   timingSafeEqual,
 } from "node:crypto";
 import { dbSource, getSql, type Sql } from "@/lib/db";
-import {
-  DEMO_PASSWORD,
-  type Database,
-  type Row,
-  type User,
-} from "./types";
+import type { Database, Row, User } from "./types";
 import {
   Problem,
   auditLog,
   dispatch,
   hashPassword,
-  login as engineLogin,
   seedDemo,
   snapshot,
 } from "./engine";
@@ -25,7 +20,7 @@ import {
 const SESSION_TTL_SECONDS = 8 * 60 * 60;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_FAILURES = 5;
-const DEMO_PASSWORD_HASH = hashPassword(DEMO_PASSWORD);
+const SCRYPT_BYTES = 32;
 
 type StoredState = {
   db: Database;
@@ -110,7 +105,7 @@ async function loadStoredState(): Promise<StoredState> {
     return { db, sql, updatedAt: asIso(row.updated_at) };
   }
 
-  // Demo/local development may bootstrap itself. A real Neon database never
+  // Local development may bootstrap demo data. A real Neon database never
   // reconstructs state from the stale relational mirror and never accepts an
   // implicit demo seed.
   if (dbSource === "pglite" && process.env.VERCEL !== "1") {
@@ -131,7 +126,7 @@ async function loadStoredState(): Promise<StoredState> {
 
   throw new Problem(
     "STATE_UNAVAILABLE",
-    "State produksi BIOFLOG tidak tersedia atau tidak valid. Tidak ada fallback ke data relasional/demo.",
+    "State produksi BIOFLOG tidak tersedia atau tidak valid. Tidak ada fallback ke data relasional atau demo.",
     503,
   );
 }
@@ -166,9 +161,8 @@ function sessionSecret(): Buffer {
 
   const databaseUrl = process.env.DATABASE_URL?.trim();
   if (databaseUrl) {
-    // Keeps the token key server-only even before a dedicated session secret is
-    // provisioned. Rotating the database credential intentionally revokes every
-    // outstanding session. BIOFLOG_SESSION_SECRET remains the preferred key.
+    // Transitional server-only fallback until BIOFLOG_SESSION_SECRET is set.
+    // A DATABASE_URL rotation intentionally revokes every outstanding session.
     return createHash("sha256")
       .update("bioflog-session-v1\0")
       .update(databaseUrl)
@@ -192,9 +186,7 @@ function parseClaims(token: string): SessionClaims {
   if (!payload || !signature || extra) {
     throw new Problem("SESSION_INVALID", "Sesi tidak valid. Masuk kembali.", 401);
   }
-  const expected = createHmac("sha256", sessionSecret())
-    .update(payload)
-    .digest();
+  const expected = createHmac("sha256", sessionSecret()).update(payload).digest();
   let supplied: Buffer;
   try {
     supplied = Buffer.from(signature, "base64url");
@@ -220,6 +212,33 @@ function parseClaims(token: string): SessionClaims {
     throw new Problem("SESSION_EXPIRED", "Sesi berakhir. Masuk kembali.", 401);
   }
   return claims;
+}
+
+function isStrongPasswordHash(value: string): boolean {
+  return /^scrypt\$[0-9a-f]{32}\$[0-9a-f]{64}$/i.test(value);
+}
+
+function strongPasswordHash(password: string): string {
+  const salt = randomBytes(16);
+  const derived = scryptSync(password, salt, SCRYPT_BYTES);
+  return `scrypt$${salt.toString("hex")}$${derived.toString("hex")}`;
+}
+
+function passwordMatches(password: string, stored: string): boolean {
+  if (!isStrongPasswordHash(stored)) {
+    // Compatibility with the exported Grok pilot state. Every production user
+    // with this legacy hash is forced through a password-change upgrade before
+    // any farm data is returned.
+    return hashPassword(password) === stored;
+  }
+  const [, saltHex, expectedHex] = stored.split("$");
+  const expected = Buffer.from(expectedHex, "hex");
+  const actual = scryptSync(password, Buffer.from(saltHex, "hex"), expected.length);
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+function requiresPasswordUpgrade(user: User): boolean {
+  return dbSource === "neon" && !isStrongPasswordHash(user.password_hash);
 }
 
 function publicUser(user: User): Row {
@@ -312,6 +331,34 @@ async function recordLoginAttempt(
   );
 }
 
+function changeOwnPassword(db: Database, user: User, payload: Row): Row {
+  const current = String(payload.current_password ?? "");
+  const replacement = String(payload.new_password ?? "");
+  if (!passwordMatches(current, user.password_hash)) {
+    throw new Problem("PASSWORD_INVALID", "Password saat ini tidak cocok.", 403);
+  }
+  if (replacement.length < 12 || replacement.length > 256) {
+    throw new Problem("PASSWORD_LENGTH", "Password baru harus 12–256 karakter.");
+  }
+  if (replacement === current) {
+    throw new Problem("PASSWORD_REUSE", "Password baru harus berbeda dari password saat ini.");
+  }
+  user.password_hash = strongPasswordHash(replacement);
+  user.version += 1;
+  db.audit.push({
+    id: randomUUID(),
+    farm_id: user.farm_id,
+    actor_id: user.id,
+    action: "users/password",
+    object_id: user.id,
+    occurred_at: new Date().toISOString(),
+    before: {},
+    after: { password_changed: true },
+    request_id: randomUUID(),
+  });
+  return { id: user.id, password_changed: true };
+}
+
 export async function farmStatus() {
   assertDeploymentDatabase();
   try {
@@ -341,17 +388,16 @@ export async function loginFarmSession(emailInput: string, password: string) {
   const state = await loadStoredState();
   await assertLoginRate(state.sql, email);
 
-  let user: User;
-  try {
-    user = engineLogin(state.db, email, password);
-  } catch (error) {
+  const user = state.db.users.find(
+    (candidate) => candidate.email.toLowerCase() === email && candidate.active,
+  );
+  if (!user || !passwordMatches(password, user.password_hash)) {
     await recordLoginAttempt(state.sql, email, false);
-    throw error;
+    throw new Problem("LOGIN", "Email atau password tidak cocok.", 401);
   }
   await recordLoginAttempt(state.sql, email, true);
 
-  const requiresPasswordChange =
-    dbSource === "neon" && user.password_hash === DEMO_PASSWORD_HASH;
+  const requiresPasswordChange = requiresPasswordUpgrade(user);
   return {
     source: dbSource,
     pondCount: state.db.ponds.length,
@@ -365,14 +411,13 @@ export async function loginFarmSession(emailInput: string, password: string) {
 
 export async function resumeFarmSession(sessionToken: string) {
   const state = await loadStoredState();
-  const { user, claims } = sessionUser(state.db, sessionToken);
-  const requiresPasswordChange =
-    dbSource === "neon" && user.password_hash === DEMO_PASSWORD_HASH;
+  const { user } = sessionUser(state.db, sessionToken);
+  const requiresPasswordChange = requiresPasswordUpgrade(user);
   return {
     source: dbSource,
     pondCount: state.db.ponds.length,
     updatedAt: state.updatedAt,
-    sessionToken: makeSession(user, requiresPasswordChange || claims.restricted === 1),
+    sessionToken: makeSession(user, requiresPasswordChange),
     requiresPasswordChange,
     user: publicUser(user),
     view: requiresPasswordChange ? null : clientView(state.db, user),
@@ -389,19 +434,32 @@ export async function mutateFarmSession(
   if (claims.restricted === 1 && action !== "users/password") {
     throw new Problem(
       "PASSWORD_CHANGE_REQUIRED",
-      "Password demo publik wajib diganti sebelum akun dapat mengubah data farm.",
+      "Password lama wajib diganti sebelum akun dapat membuka atau mengubah data farm.",
       403,
     );
   }
 
-  const result = dispatch(state.db, user, action, payload);
+  let result: Row;
+  if (action === "users/password") {
+    result = changeOwnPassword(state.db, user, payload);
+  } else {
+    result = dispatch(state.db, user, action, payload);
+    // New accounts are immediately stored using the stronger server-side hash,
+    // even though the legacy domain engine still creates its initial hash.
+    if (action === "users" && result.id) {
+      const created = state.db.users.find((candidate) => candidate.id === result.id);
+      if (created) created.password_hash = strongPasswordHash(String(payload.password ?? ""));
+    }
+  }
+
   const updatedAt = await saveStoredState(state.sql, state.db, state.updatedAt);
-  const currentUser = state.db.users.find((candidate) => candidate.id === user.id && candidate.active);
+  const currentUser = state.db.users.find(
+    (candidate) => candidate.id === user.id && candidate.active,
+  );
   if (!currentUser) {
     throw new Problem("SESSION_REVOKED", "Akun tidak lagi aktif.", 401);
   }
-  const requiresPasswordChange =
-    dbSource === "neon" && currentUser.password_hash === DEMO_PASSWORD_HASH;
+  const requiresPasswordChange = requiresPasswordUpgrade(currentUser);
 
   return {
     source: dbSource,
