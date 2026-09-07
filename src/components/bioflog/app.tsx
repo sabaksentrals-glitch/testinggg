@@ -200,7 +200,10 @@ function Editor({
         if (f.type === "json") p[f.key] = JSON.parse(p[f.key]);
       }
       if (spec.transform) p = spec.transform(p);
-      const r = mutate(spec.action, p);
+      // Awaited: the server must accept and persist the write before this form
+      // reports success or closes. A rejection lands in the catch below, which
+      // shows the error and leaves the form — and the operator's input — intact.
+      const r = await mutate(spec.action, p);
       if (r.provisioning_token) {
         setError("Simpan token perangkat ini sekali: " + r.provisioning_token);
         return;
