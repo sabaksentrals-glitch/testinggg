@@ -28,15 +28,19 @@ class Problem extends Error {
  */
 async function runSubmit(mutate: () => Promise<Record<string, unknown>>) {
   const calls: string[] = [];
-  let shown = "";
+  /** Every browser-alert presentation, so duplicates are detectable. */
+  const alerts: string[] = [];
   let error = "";
   try {
     const r = await mutate();
     calls.push("awaited");
     if (r.provisioning_token) {
-      shown = String(r.provisioning_token);
-      calls.push("token-shown");
-      return { calls, shown, error };
+      alerts.push(
+        "Simpan token perangkat ini sekali. Token tidak akan ditampilkan lagi:\n\n" +
+          String(r.provisioning_token),
+      );
+      calls.push("alert");
+      return { calls, alerts, error };
     }
     calls.push("onDone");
     calls.push("onClose");
@@ -44,7 +48,7 @@ async function runSubmit(mutate: () => Promise<Record<string, unknown>>) {
     error = err instanceof Error ? err.message : "unknown";
     calls.push("caught");
   }
-  return { calls, shown, error };
+  return { calls, alerts, error };
 }
 
 /** What the store does with its state after a failure. */
@@ -153,15 +157,29 @@ test("F: a rejected mutation calls neither onDone nor onClose", async () => {
   assert.ok(!calls.includes("onClose"), "form must stay open so input survives");
 });
 
-// G — provisioning token
-test("G: a provisioning token is surfaced after success and keeps the form open", async () => {
-  const { calls, shown } = await runSubmit(async () => ({
+// G — provisioning token, presented exactly as it was before this branch
+test("G: a provisioning token is alerted once after success and keeps the form open", async () => {
+  const { calls, alerts } = await runSubmit(async () => ({
     id: "d1",
     provisioning_token: "tok-once-123",
   }));
-  assert.equal(shown, "tok-once-123", "token still reaches the operator");
-  assert.ok(calls.includes("awaited"), "only after the server confirmed");
-  assert.ok(!calls.includes("onClose"), "form stays open so the token can be copied");
+  assert.equal(alerts.length, 1, "shown exactly once — no duplicate presentation");
+  assert.equal(
+    alerts[0],
+    "Simpan token perangkat ini sekali. Token tidak akan ditampilkan lagi:\n\ntok-once-123",
+    "original pre-PR alert wording preserved",
+  );
+  assert.deepEqual(calls, ["awaited", "alert"], "only after the server confirmed");
+  assert.ok(!calls.includes("onClose"), "form stays open after the alert is dismissed");
+  assert.ok(!calls.includes("onDone"), "a token result is not a plain success");
+});
+
+test("G3: the token is never presented on a rejected mutation", async () => {
+  const { calls, alerts } = await runSubmit(async () => {
+    throw new Problem("FORBIDDEN", "denied", 403);
+  });
+  assert.deepEqual(alerts, [], "failure path exposes no token");
+  assert.deepEqual(calls, ["caught"]);
 });
 
 test("G2: the failure path never carries a token", () => {
