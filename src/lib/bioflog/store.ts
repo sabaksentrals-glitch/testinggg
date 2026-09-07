@@ -3,6 +3,7 @@ import { persist } from "zustand/middleware";
 import type { Row, Role } from "./types";
 import { getFarmStatus, loginFarm, mutateFarm, resumeFarm } from "./api";
 import { validatePasswordChange } from "./password-policy";
+import { mutationFailureAction } from "./mutation-contract";
 
 export class Problem extends Error {
   code: string;
@@ -43,7 +44,12 @@ type Store = {
   logout: () => void;
   user: () => ClientUser | null;
   state: () => Row | null;
-  mutate: (action: string, payload: Row) => Row;
+  /**
+   * Resolves only after the server has accepted and persisted the write.
+   * Rejects with the server error otherwise — callers must await it before
+   * reporting success or closing a form.
+   */
+  mutate: (action: string, payload: Row) => Promise<Row>;
   /**
    * Forced rotation for a legacy pilot credential. Async on purpose: the caller
    * must be able to await the server's verdict and show the real error, which
@@ -253,7 +259,7 @@ export const useBioflog = create<Store>()(
         }),
       user: () => get().userData,
       state: () => get().view,
-      mutate: (action, payload) => {
+      mutate: async (action, payload) => {
         const token = get().sessionToken;
         if (!token) {
           throw new Problem("UNAUTHENTICATED", "Sesi berakhir. Masuk kembali.", 401);
@@ -262,67 +268,65 @@ export const useBioflog = create<Store>()(
           throw new Problem("SAVE_BUSY", "Penyimpanan sebelumnya masih berjalan. Tunggu sebentar.", 409);
         }
         mutationInFlight = true;
-        // The legacy UI calls mutate synchronously. Enter an explicit loading
-        // state immediately so the screen never keeps presenting an optimistic
-        // edit as authoritative while the server is still validating it.
-        set({ hydrated: false, syncError: null });
-        void mutateFarm({ data: { sessionToken: token, action, payload } })
-          .then((rawResponse) => {
-            const response = rawResponse as SessionResponse & { result: Row };
-            const nextUser = asClientUser(response.view?.user) ?? get().userData;
-            const provisioningToken = response.result?.provisioning_token;
-            if (provisioningToken && typeof window !== "undefined") {
-              window.alert(
-                "Simpan token perangkat ini sekali. Token tidak akan ditampilkan lagi:\n\n" +
-                  provisioningToken,
-              );
-            }
-            if (action === "users/password") {
-              set({
-                sessionToken: null,
-                userData: null,
-                view: null,
-                dbSource: response.source,
-                pondCount: response.pondCount,
-                requiresPasswordChange: false,
-                hydrated: true,
-                syncError: "Password berhasil diganti. Silakan masuk kembali.",
-              });
-              return;
-            }
+        set({ syncError: null });
+        try {
+          const rawResponse = await mutateFarm({
+            data: { sessionToken: token, action, payload },
+          });
+          const response = rawResponse as SessionResponse & { result: Row };
+          const nextUser = asClientUser(response.view?.user) ?? get().userData;
+          if (action === "users/password") {
             set({
-              sessionToken: response.sessionToken,
-              userData: nextUser,
-              view: response.view,
+              sessionToken: null,
+              userData: null,
+              view: null,
               dbSource: response.source,
               pondCount: response.pondCount,
-              requiresPasswordChange: response.requiresPasswordChange,
+              requiresPasswordChange: false,
               hydrated: true,
-              syncError: response.requiresPasswordChange
-                ? "Rotasi password wajib sebelum melanjutkan."
-                : null,
+              syncError: "Password berhasil diganti. Silakan masuk kembali.",
             });
-          })
-          .catch((error) => {
-            // Fail visibly. We deliberately drop the local session instead of
-            // leaving the operator on a screen that claimed a rejected write
-            // had succeeded.
+            return response.result ?? {};
+          }
+          set({
+            sessionToken: response.sessionToken,
+            userData: nextUser,
+            view: response.view,
+            dbSource: response.source,
+            pondCount: response.pondCount,
+            requiresPasswordChange: response.requiresPasswordChange,
+            hydrated: true,
+            syncError: response.requiresPasswordChange
+              ? "Rotasi password wajib sebelum melanjutkan."
+              : null,
+          });
+          // Returned only after the server confirmed the write, so the caller
+          // may not announce success or close its form before this resolves.
+          return response.result ?? {};
+        } catch (error) {
+          const outcome = mutationFailureAction(
+            error,
+            "Perubahan ditolak server dan tidak disimpan.",
+          );
+          if (outcome.clearSession) {
             set({
               sessionToken: null,
               userData: null,
               view: null,
               requiresPasswordChange: false,
               hydrated: true,
-              syncError: errorMessage(
-                error,
-                "Perubahan ditolak server dan tidak disimpan. Silakan masuk kembali.",
-              ),
+              syncError: outcome.syncError,
             });
-          })
-          .finally(() => {
-            mutationInFlight = false;
-          });
-        return {};
+          } else {
+            // A rejected write is not a lost session: keep the token, the user
+            // and the current view so the operator stays where they were and
+            // can correct the input.
+            set({ syncError: outcome.syncError });
+          }
+          throw error;
+        } finally {
+          mutationInFlight = false;
+        }
       },
       changePassword: async (currentPassword, newPassword) => {
         const token = get().sessionToken;

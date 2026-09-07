@@ -200,9 +200,22 @@ function Editor({
         if (f.type === "json") p[f.key] = JSON.parse(p[f.key]);
       }
       if (spec.transform) p = spec.transform(p);
-      const r = mutate(spec.action, p);
+      // Awaited: the server must accept and persist the write before this form
+      // reports success or closes. A rejection lands in the catch below, which
+      // shows the error and leaves the form — and the operator's input — intact.
+      const r = await mutate(spec.action, p);
       if (r.provisioning_token) {
-        setError("Simpan token perangkat ini sekali: " + r.provisioning_token);
+        // Presented exactly as before this branch: a browser alert, with the
+        // original wording. It now fires here rather than inside the store,
+        // because the store no longer sees the result first — putting it back
+        // there would show the token twice. Shown only after the server
+        // confirmed the write, once, and the form stays open afterwards.
+        if (typeof window !== "undefined") {
+          window.alert(
+            "Simpan token perangkat ini sekali. Token tidak akan ditampilkan lagi:\n\n" +
+              r.provisioning_token,
+          );
+        }
         return;
       }
       onDone("Data berhasil disimpan di perangkat.");
